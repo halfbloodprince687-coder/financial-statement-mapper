@@ -27,6 +27,7 @@ if _missing:
 import engine
 import writer
 import validator
+import converter
 
 st.set_page_config(page_title="Financial Statement Mapper", layout="wide")
 
@@ -70,6 +71,18 @@ def save_upload(uploaded_file) -> str | None:
         return None
 
 
+@st.cache_data(show_spinner="Converting .xls destination template to .xlsx...")
+def _convert_xls_bytes_cached(file_bytes: bytes, filename: str) -> bytes:
+    """Cached so the (slow-ish) LibreOffice conversion only runs once per
+    distinct uploaded file, not on every Streamlit rerun."""
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".xls")
+    tmp.write(file_bytes)
+    tmp.close()
+    xlsx_path = converter.convert_xls_to_xlsx(tmp.name)
+    with open(xlsx_path, "rb") as f:
+        return f.read()
+
+
 # --------------------------------------------------------------------------
 # Sidebar - file inputs & multiplier
 # --------------------------------------------------------------------------
@@ -84,12 +97,11 @@ def sidebar():
 
     source_file = st.sidebar.file_uploader("Source file (financial statement) - .xls or .xlsx", type=["xls", "xlsx"])
     dest_file = st.sidebar.file_uploader(
-        "Destination template - .xlsx only",
-        type=["xlsx"],
+        "Destination template - .xls or .xlsx",
+        type=["xls", "xlsx"],
         help="The MCA/ROC filing template with FieldPLBS.. Field-ID columns. "
-             "If your master template is only saved as .xls, open it once in "
-             "Excel/LibreOffice and 'Save As' .xlsx - you only need to do this once, "
-             "the same template is reused every filing period.",
+             "A .xls file is converted to .xlsx automatically (this needs LibreOffice "
+             "installed - see README if that's not available in your environment).",
     )
 
     st.sidebar.title("2. Multiplication factor")
@@ -114,19 +126,43 @@ def sidebar():
             dest_path = os.path.join(tmp_dir, "destination_file.xlsx")
             shutil.copyfile(SAMPLE_SOURCE, source_path)
             shutil.copyfile(SAMPLE_DEST, dest_path)
+        except FileNotFoundError as e:
+            st.sidebar.error(
+                f"The bundled sample files aren't present in this deployment ({e}).\n\n"
+                "This means the `sample_data/` folder didn't make it into the GitHub repo "
+                "that's deployed here - GitHub's web 'Upload files' drag-and-drop can silently "
+                "skip subfolders. Push the whole `app/` folder with `git add . && git commit "
+                "&& git push` instead (which preserves subfolders reliably), or just upload "
+                "your own source and destination files below - that doesn't need the sample "
+                "files at all."
+            )
+            source_path, dest_path = None, None
         except (PermissionError, OSError) as e:
             st.sidebar.error(
                 f"Could not read the bundled sample files ({e}).\n\n"
-                "On Windows, this is usually the zip's files being 'Blocked' after "
-                "download: right-click the downloaded .zip -> Properties -> tick "
-                "'Unblock' -> OK, then re-extract, or simply upload your own files "
-                "below instead."
+                "On Windows (when running locally), this is usually the zip's files being "
+                "'Blocked' after download: right-click the downloaded .zip -> Properties -> "
+                "tick 'Unblock' -> OK, then re-extract - or just upload your own files below."
             )
             source_path, dest_path = None, None
     if source_file is not None:
         source_path = save_upload(source_file)
     if dest_file is not None:
-        dest_path = save_upload(dest_file)
+        raw_path = save_upload(dest_file)
+        if raw_path and raw_path.lower().endswith(".xls"):
+            try:
+                xlsx_bytes = _convert_xls_bytes_cached(dest_file.getvalue(), dest_file.name)
+                converted_path = os.path.join(tempfile.mkdtemp(prefix="fsm_converted_"),
+                                               os.path.splitext(dest_file.name)[0] + ".xlsx")
+                with open(converted_path, "wb") as f:
+                    f.write(xlsx_bytes)
+                dest_path = converted_path
+                st.sidebar.success(f"Converted '{dest_file.name}' from .xls to .xlsx automatically.")
+            except converter.ConversionUnavailable as e:
+                st.sidebar.error(str(e))
+                dest_path = None
+        else:
+            dest_path = raw_path
 
     return source_path, dest_path, multiplier
 
